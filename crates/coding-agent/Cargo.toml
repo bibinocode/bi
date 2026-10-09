@@ -1,0 +1,10 @@
+[package]
+name = "bi-coding-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bi-ai.workspace = true
+bi-agent.workspace = true
+bi-tui.workspace = true
+bi-codemode.workspace = true

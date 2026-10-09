@@ -1,0 +1,7 @@
+[package]
+name = "bi-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bi-ai.workspace = true

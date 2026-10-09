@@ -1,0 +1,6 @@
+[package]
+name = "bi-ai"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

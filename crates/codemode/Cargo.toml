@@ -1,0 +1,6 @@
+[package]
+name = "bi-codemode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

@@ -1,0 +1,11 @@
+[package]
+name = "bi-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+crossterm = "0.29.0"
+ratatui = {version = "0.30.2",default-features = false, features = ["crossterm"]}
+thiserror = "2.0.21"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.2"

@@ -1,0 +1,30 @@
+[package]
+name = "bi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bi-coding-agent = { path = "crates/coding-agent" }
+
+[workspace]
+members = [
+    "crates/ai",
+    "crates/agent",
+    "crates/coding-agent",
+    "crates/tui",
+    "crates/codemode",
+]
+
+# resolver 是 cargo workspace 的一个配置项，用于指定 workspace 中的依赖解析器。
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace.dependencies]
+bi-ai = { path = "crates/ai" }
+bi-agent = { path = "crates/agent" }
+bi-tui = { path = "crates/tui" }
+bi-codemode = { path = "crates/codemode" }
