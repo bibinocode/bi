@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{io, io::Write, time::Duration};
 
 use ratatui::{Terminal, backend::Backend};
 use thiserror::Error;
@@ -10,7 +10,7 @@ use crate::{
         Capabilities, ClipRect, ComponentError, ComponentEvent, Key, KeyKind, LayoutContext,
         Offset, ScreenMode, Size,
     },
-    render::{layout_cursor, paint_layout},
+    render::{layout_cursor, paint_layout, paint_layout_with_images},
     runtime::{PointerTracker, Runtime},
 };
 
@@ -46,7 +46,7 @@ impl Default for RunOptions {
             poll_interval: Duration::from_millis(16),
             message_budget: 64,
             exit_on_escape: true,
-            capabilities: Capabilities::default(),
+            capabilities: super::detect_capabilities(),
         }
     }
 }
@@ -56,6 +56,7 @@ pub struct DrawnLayout {
     pub root: Option<LayoutNode>,
     pub offset: Offset,
     pub viewport: ClipRect,
+    pub buffer: ratatui::buffer::Buffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +109,7 @@ pub fn dispatch_terminal_event(
                 root: Some(root),
                 offset,
                 viewport,
+                ..
             }) = drawn
             {
                 for event in pointer.process(event) {
@@ -166,7 +168,11 @@ where
                         focused: false,
                     })?;
                     if let Some(root) = &root {
-                        paint_layout(root, offset, frame.buffer_mut())?;
+                        if capabilities.images.is_some() {
+                            paint_layout_with_images(root, offset, frame.buffer_mut())?;
+                        } else {
+                            paint_layout(root, offset, frame.buffer_mut())?;
+                        }
                         if let Some(cursor) =
                             layout_cursor(root, runtime.focused_handle(), offset, viewport)?
                         {
@@ -179,6 +185,7 @@ where
                         root,
                         offset,
                         viewport,
+                        buffer: frame.buffer_mut().clone(),
                     });
                     Ok::<_, ComponentError>(())
                 })();
@@ -226,30 +233,84 @@ fn run_loop(
 ) -> Result<(), TuiError> {
     let mut drawn = None;
     let mut pointer = PointerTracker::default();
+    let mut output = super::TerminalOutput::default();
     runtime.request_redraw();
-    loop {
-        runtime.drain_messages(options.message_budget)?;
-        if runtime.take_redraw_request() {
-            let mode = session.screen_mode();
-            drawn = Some(draw_runtime(
+    let result = (|| {
+        loop {
+            runtime.drain_messages(options.message_budget)?;
+            if runtime.take_redraw_request() {
+                let mode = session.screen_mode();
+                if output.needs_clear() {
+                    session
+                        .terminal_mut()
+                        .clear()
+                        .map_err(|error| TuiError::Backend(error.to_string()))?;
+                }
+                // 同步更新包裹文本、链接与图片，失败时也尝试结束同步模式。
+                let mut writer = io::stdout();
+                writer.write_all(b"\x1b[?2026h")?;
+                writer.flush()?;
+                if let Some(maximum) = session.dynamic_max_height() {
+                    let size = session.terminal_mut().size()?;
+                    let natural = runtime
+                        .layout(&LayoutContext {
+                            width: size.width,
+                            terminal_size: Size {
+                                width: size.width,
+                                height: size.height,
+                            },
+                            available_height: None,
+                            screen_mode: mode,
+                            capabilities: options.capabilities,
+                            focused: false,
+                        })?
+                        .map_or(1, |root| root.snapshot.height.max(1));
+                    session.resize_inline_height(
+                        natural
+                            .min(usize::from(maximum))
+                            .min(usize::from(size.height.max(1))) as u16,
+                    )?;
+                }
+                let frame =
+                    draw_runtime(runtime, session.terminal_mut(), mode, options.capabilities)
+                        .and_then(|frame| {
+                            if let Some(root) = &frame.root {
+                                output.write_frame(
+                                    &mut writer,
+                                    root,
+                                    frame.offset,
+                                    frame.viewport,
+                                    &frame.buffer,
+                                    options.capabilities,
+                                )?;
+                            } else {
+                                output.clear(&mut writer)?;
+                            }
+                            Ok(frame)
+                        });
+                let end = writer
+                    .write_all(b"\x1b[?2026l")
+                    .and_then(|_| writer.flush());
+                drawn = Some(frame?);
+                end?;
+            }
+            if !crossterm::event::poll(options.poll_interval)? {
+                continue;
+            }
+            if dispatch_terminal_event(
                 runtime,
-                session.terminal_mut(),
-                mode,
-                options.capabilities,
-            )?);
+                read_event()?,
+                drawn.as_ref(),
+                &mut pointer,
+                options,
+            )? == LoopControl::Exit
+            {
+                return Ok(());
+            }
         }
-        if !crossterm::event::poll(options.poll_interval)? {
-            continue;
-        }
-        if dispatch_terminal_event(
-            runtime,
-            read_event()?,
-            drawn.as_ref(),
-            &mut pointer,
-            options,
-        )? == LoopControl::Exit
-        {
-            return Ok(());
-        }
-    }
+    })();
+    let cleanup = io::stdout()
+        .write_all(b"\x1b[?2026l")
+        .and_then(|_| output.clear(&mut io::stdout()));
+    result.and_then(|()| cleanup.map_err(Into::into))
 }

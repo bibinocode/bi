@@ -37,7 +37,7 @@ bi/
 | `bi-ai` | 统一 LLM API、自动模型发现、提供商配置，可单独作为库使用 | 无 |
 | `bi-agent` | 通用 Agent 核心循环、传输抽象、状态管理、附件支持 | `bi-ai` |
 | `bi-coding-agent` | 编程 Agent 业务流程、读/执行/编辑/写工具、会话管理 | `bi-ai`、`bi-agent`、`bi-tui`、`bi-codemode` |
-| `bi-tui` | 组件布局、Ratatui 绘制、终端会话、事件循环、焦点与资源管理；Markdown 和代码高亮待实现 | 无 |
+| `bi-tui` | 组件布局、Ratatui 绘制、终端会话、事件循环、焦点与资源管理；Markdown、代码高亮、图片协议、搜索与浮层 | 无 |
 | `bi-codemode` | 工具编排与 JavaScript 沙箱 | 无 |
 
 `bi-tui` 不依赖 AI 相关模块。已接入 Ratatui、Crossterm、thiserror、unicode-segmentation 和 unicode-width；组件使用结构化快照表达内容，不直接输出 ANSI。运行时设计与限制见 [TUI 运行时](tui-runtime.md)。

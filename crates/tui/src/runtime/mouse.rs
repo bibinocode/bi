@@ -73,7 +73,7 @@ impl Runtime {
     /// 组件收到的 PointerEvent 使用各自的局部坐标。
     pub fn dispatch_pointer(
         &mut self,
-        event: PointerEvent,
+        mut event: PointerEvent,
         layout: &LayoutNode,
         root_offset: Offset,
         viewport: ClipRect,
@@ -119,6 +119,12 @@ impl Runtime {
                 reason: "pointer target is missing from layout".into(),
             });
         }
+        if let Some(scope) = self.focus_scope {
+            let Some(index) = path.iter().position(|(handle, _)| *handle == scope) else {
+                return Ok(true);
+            };
+            path.drain(..index);
+        }
 
         // 分发前先校验整个路径，避免部分组件先收到事件，
         // 随后才发现祖先句柄已经失效。
@@ -155,6 +161,11 @@ impl Runtime {
             let response = self.send_event(handle, &local_event)?;
 
             self.apply_response(handle, response, true)?;
+            if let Some(rows) = response.scroll_remainder
+                && let PointerKind::Scroll { columns, .. } = event.kind
+            {
+                event.kind = PointerKind::Scroll { columns, rows };
+            }
 
             if response.handled {
                 return Ok(true);

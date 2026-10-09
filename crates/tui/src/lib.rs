@@ -8,4 +8,6 @@ pub mod runtime;
 pub mod terminal;
 pub mod widgets;
 
+pub mod keybindings;
+pub mod keys;
 pub mod utils;

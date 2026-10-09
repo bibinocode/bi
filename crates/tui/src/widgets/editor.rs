@@ -49,6 +49,7 @@ pub struct Editor {
     rows: Vec<Row>,
     preferred_column: Option<usize>,
     provider: Option<Box<dyn AutocompleteProvider>>,
+    auto_complete: bool,
     completions: Vec<Completion>,
     selected_completion: usize,
     menu_start: usize,
@@ -59,6 +60,11 @@ pub struct Editor {
     draft: Option<Document>,
     on_submit: Option<TextCallback>,
     on_change: Option<TextCallback>,
+    kill_ring: crate::utils::kill_ring::KillRing,
+    last_kill: bool,
+    yank: Option<Range<usize>>,
+    last_insert: Option<(std::time::Instant, usize)>,
+    typing: bool,
 }
 
 impl Default for Editor {
@@ -77,6 +83,7 @@ impl Editor {
             rows: Vec::new(),
             preferred_column: None,
             provider: None,
+            auto_complete: false,
             completions: Vec::new(),
             selected_completion: 0,
             menu_start: 0,
@@ -87,6 +94,11 @@ impl Editor {
             draft: None,
             on_submit: None,
             on_change: None,
+            kill_ring: Default::default(),
+            last_kill: false,
+            yank: None,
+            last_insert: None,
+            typing: false,
         }
     }
     /// 包含补全菜单的最大可见行数；零表示不显示。
@@ -96,6 +108,11 @@ impl Editor {
     }
     pub fn with_autocomplete(mut self, provider: impl AutocompleteProvider + 'static) -> Self {
         self.provider = Some(Box::new(provider));
+        self
+    }
+    /// 输入文本后更新候选；自动请求只显示菜单，不自动替换文本。
+    pub fn with_auto_complete(mut self, enabled: bool) -> Self {
+        self.auto_complete = enabled;
         self
     }
     pub fn on_submit(mut self, callback: impl FnMut(&str) + 'static) -> Self {
@@ -132,6 +149,9 @@ impl Editor {
             ..Document::default()
         };
         self.undo.clear();
+        self.last_insert = None;
+        self.last_kill = false;
+        self.yank = None;
         self.history_index = None;
         self.draft = None;
         self.scroll_top = 0;
@@ -147,6 +167,7 @@ impl Editor {
         Ok(())
     }
     pub fn insert_text(&mut self, text: &str) -> ComponentResult<()> {
+        self.typing = false;
         let text = normalize(text)?;
         self.edit(self.document.cursor..self.document.cursor, &text)?;
         Ok(())
@@ -206,7 +227,15 @@ impl Editor {
         if range.is_empty() && text.is_empty() {
             return Ok(());
         }
-        self.checkpoint();
+        let merge = self.typing
+            && range.is_empty()
+            && self.last_insert.is_some_and(|(at, cursor)| {
+                cursor == range.start && at.elapsed() < std::time::Duration::from_millis(500)
+            });
+        if !merge {
+            self.checkpoint();
+        }
+        self.last_insert = None;
         self.document
             .pastes
             .retain(|paste| range.end <= paste.range.start || range.start >= paste.range.end);
@@ -223,6 +252,9 @@ impl Editor {
             .into_iter()
             .find(|index| *index >= self.document.cursor)
             .unwrap_or(self.document.text.len());
+        if self.typing {
+            self.last_insert = Some((std::time::Instant::now(), self.document.cursor));
+        }
         self.history_index = None;
         self.draft = None;
         if notify {
@@ -234,6 +266,79 @@ impl Editor {
             self.preferred_column = None;
         }
         Ok(())
+    }
+    fn kill(&mut self, range: Range<usize>, backward: bool) -> ComponentResult<()> {
+        let mut text = String::new();
+        let mut pos = range.start;
+        for paste in &self.document.pastes {
+            if paste.range.start >= range.start && paste.range.end <= range.end {
+                text.push_str(&self.document.text[pos..paste.range.start]);
+                text.push_str(&paste.text);
+                pos = paste.range.end;
+            }
+        }
+        text.push_str(&self.document.text[pos..range.end]);
+        self.edit(range, "")?;
+        self.kill_ring.push(text, backward, self.last_kill);
+        self.last_kill = true;
+        Ok(())
+    }
+    fn yank(&mut self, rotate: bool) -> ComponentResult<()> {
+        let range = if rotate {
+            let Some(range) = self.yank.clone() else {
+                return Ok(());
+            };
+            self.kill_ring.rotate();
+            range
+        } else {
+            self.document.cursor..self.document.cursor
+        };
+        let Some(text) = self.kill_ring.peek().map(str::to_owned) else {
+            return Ok(());
+        };
+        if !self.boundaries().contains(&range.start) || !self.boundaries().contains(&range.end) {
+            self.yank = None;
+            return Ok(());
+        }
+        self.edit(range.clone(), &text)?;
+        self.yank = Some(range.start..range.start + text.len());
+        Ok(())
+    }
+    fn word_left(&self) -> usize {
+        let mut target = self.document.cursor;
+        let mut word = false;
+        for pair in self.boundaries().windows(2).rev() {
+            if pair[1] > self.document.cursor {
+                continue;
+            }
+            let whitespace = self.document.text[pair[0]..pair[1]]
+                .chars()
+                .all(char::is_whitespace);
+            if word && whitespace {
+                break;
+            }
+            word |= !whitespace;
+            target = pair[0];
+        }
+        target
+    }
+    fn word_right(&self) -> usize {
+        let mut target = self.document.cursor;
+        let mut word = false;
+        for pair in self.boundaries().windows(2) {
+            if pair[0] < self.document.cursor {
+                continue;
+            }
+            let whitespace = self.document.text[pair[0]..pair[1]]
+                .chars()
+                .all(char::is_whitespace);
+            if word && whitespace {
+                break;
+            }
+            word |= !whitespace;
+            target = pair[1];
+        }
+        target
     }
     fn paste(&mut self, text: &str) -> ComponentResult<()> {
         let text = normalize(text)?;
@@ -399,7 +504,7 @@ impl Editor {
         self.changed();
         true
     }
-    fn complete(&mut self) -> ComponentResult<bool> {
+    fn complete(&mut self, accept_single: bool) -> ComponentResult<bool> {
         let Some(provider) = &self.provider else {
             return Ok(false);
         };
@@ -422,7 +527,7 @@ impl Editor {
         }
         self.completions = suggestions.into_iter().take(64).collect();
         self.selected_completion = 0;
-        if self.completions.len() == 1 {
+        if accept_single && self.completions.len() == 1 {
             self.accept_completion()?;
             return Ok(true);
         }
@@ -554,8 +659,25 @@ impl Component for Editor {
         event: &ComponentEvent,
         _host: &mut dyn ComponentHost,
     ) -> ComponentResult<EventResponse> {
+        self.typing = matches!(event, ComponentEvent::Text(_));
+        if !self.typing
+            && !matches!(event, ComponentEvent::Key(e) if !e.modifiers.control && !e.modifiers.alt && matches!(e.key, Key::Character(_)))
+        {
+            self.last_insert = None;
+        }
+        let killing = matches!(event, ComponentEvent::Key(e) if e.kind != KeyKind::Release && ((e.modifiers.control && matches!(e.key, Key::Character('u'|'k'|'w'))) || (e.modifiers.alt && matches!(e.key, Key::Character('d') | Key::Backspace | Key::Delete))));
+        if !killing {
+            self.last_kill = false;
+        }
+        if !matches!(event, ComponentEvent::Key(e) if (e.modifiers.control || e.modifiers.alt) && e.key == Key::Character('y'))
+        {
+            self.yank = None;
+        }
         match event {
-            ComponentEvent::Text(text) => self.insert_text(text)?,
+            ComponentEvent::Text(text) => {
+                let text = normalize(text)?;
+                self.edit(self.document.cursor..self.document.cursor, &text)?;
+            }
             ComponentEvent::Paste(text) => self.paste(text)?,
             ComponentEvent::Key(event) if event.kind != KeyKind::Release => {
                 let key = event.base_layout_key.unwrap_or(event.key);
@@ -613,7 +735,7 @@ impl Component for Editor {
                             let start = self.document.text[..self.document.cursor]
                                 .rfind('\n')
                                 .map_or(0, |index| index + 1);
-                            self.edit(start..self.document.cursor, "")?;
+                            self.kill(start..self.document.cursor, true)?;
                         }
                         Key::Character('k') => {
                             let end = self.document.text[self.document.cursor..]
@@ -621,13 +743,30 @@ impl Component for Editor {
                                 .map_or(self.document.text.len(), |index| {
                                     self.document.cursor + index
                                 });
-                            self.edit(self.document.cursor..end, "")?;
+                            self.kill(self.document.cursor..end, false)?;
                         }
+                        Key::Character('w') => {
+                            self.kill(self.word_left()..self.document.cursor, true)?
+                        }
+                        Key::Character('y') => self.yank(false)?,
+                        Key::Left => self.document.cursor = self.word_left(),
+                        Key::Right => self.document.cursor = self.word_right(),
                         Key::Enter => self.insert_text("\n")?,
                         _ => return Ok(EventResponse::default()),
                     }
                 } else if modifiers.alt && !modifiers.control {
                     match key {
+                        Key::Character('b') | Key::Left => self.document.cursor = self.word_left(),
+                        Key::Character('f') | Key::Right => {
+                            self.document.cursor = self.word_right()
+                        }
+                        Key::Character('d') | Key::Delete => {
+                            self.kill(self.document.cursor..self.word_right(), false)?
+                        }
+                        Key::Backspace => {
+                            self.kill(self.word_left()..self.document.cursor, true)?
+                        }
+                        Key::Character('y') => self.yank(true)?,
                         Key::Enter => self.insert_text("\n")?,
                         Key::Up => {
                             self.navigate_history(true);
@@ -642,7 +781,7 @@ impl Component for Editor {
                         Key::Enter if modifiers.shift => self.insert_text("\n")?,
                         Key::Enter => self.submit()?,
                         Key::Tab if !modifiers.shift => {
-                            if !self.complete()? {
+                            if !self.complete(true)? {
                                 return Ok(EventResponse::default());
                             }
                         }
@@ -704,6 +843,10 @@ impl Component for Editor {
                 });
             }
             _ => return Ok(EventResponse::default()),
+        }
+        if self.auto_complete && matches!(event, ComponentEvent::Text(_) | ComponentEvent::Paste(_))
+        {
+            self.complete(false)?;
         }
         Ok(EventResponse {
             handled: true,
@@ -783,6 +926,10 @@ impl Component for Editor {
         }
         self.document = document;
         self.undo.clear();
+        self.last_insert = None;
+        self.last_kill = false;
+        self.yank = None;
+        self.typing = false;
         self.history_index = None;
         self.draft = None;
         self.scroll_top = 0;

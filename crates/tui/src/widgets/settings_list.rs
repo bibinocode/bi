@@ -1,3 +1,4 @@
+use super::{SelectItem, SelectList};
 use crate::{
     component::{Component, ComponentNode, LayoutSnapshot},
     protocol::{
@@ -8,6 +9,7 @@ use crate::{
 };
 use std::collections::HashSet;
 use unicode_segmentation::UnicodeSegmentation;
+type SubmenuProvider = Box<dyn FnMut(&SettingItem) -> ComponentResult<Vec<SelectItem>>>;
 
 #[derive(Debug, Clone)]
 pub struct SettingItem {
@@ -55,6 +57,9 @@ pub struct SettingsList {
     query: String,
     on_change: Option<ChangeCallback>,
     on_cancel: Option<Box<dyn FnMut()>>,
+    fuzzy: bool,
+    submenu_provider: Option<SubmenuProvider>,
+    submenu: Option<(usize, SelectList)>,
 }
 impl SettingsList {
     pub fn new(items: Vec<SettingItem>, max_visible: u16) -> ComponentResult<Self> {
@@ -88,10 +93,25 @@ impl SettingsList {
             query: String::new(),
             on_change: None,
             on_cancel: None,
+            fuzzy: false,
+            submenu_provider: None,
+            submenu: None,
         })
     }
     pub fn with_search(mut self, enabled: bool) -> Self {
         self.search = enabled;
+        self
+    }
+    pub fn with_fuzzy(mut self, enabled: bool) -> Self {
+        self.fuzzy = enabled;
+        self
+    }
+    /// Enter 激活时动态提供候选；空列表回退到原有值循环。
+    pub fn with_submenu(
+        mut self,
+        provider: impl FnMut(&SettingItem) -> ComponentResult<Vec<SelectItem>> + 'static,
+    ) -> Self {
+        self.submenu_provider = Some(Box::new(provider));
         self
     }
     pub fn on_change(mut self, callback: impl FnMut(&str, &str) + 'static) -> Self {
@@ -131,6 +151,21 @@ impl SettingsList {
     pub fn set_filter(&mut self, query: &str) -> ComponentResult<()> {
         display_width(query)?;
         self.query = query.into();
+        if self.fuzzy {
+            let mut matches: Vec<_> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    crate::utils::fuzzy::fuzzy_score(query, &item.label).map(|score| (score, i))
+                })
+                .collect();
+            matches.sort_by_key(|item| std::cmp::Reverse(item.0));
+            self.filtered = matches.into_iter().map(|(_, i)| i).collect();
+            self.selected = 0;
+            self.visible = 0;
+            return Ok(());
+        }
         let query = query.to_lowercase();
         self.filtered = self
             .items
@@ -173,6 +208,9 @@ impl Component for SettingsList {
         context: &LayoutContext,
         children: &mut [ComponentNode],
     ) -> ComponentResult<LayoutSnapshot> {
+        if let Some((_, list)) = &mut self.submenu {
+            return list.layout(context, children);
+        }
         if !children.is_empty() {
             return Err(ComponentError::InvalidLayout {
                 reason: "SettingsList does not accept children".into(),
@@ -212,10 +250,20 @@ impl Component for SettingsList {
                 .min(self.filtered.len().saturating_sub(self.visible));
             for index in self.start..self.start + self.visible {
                 let item = &self.items[self.filtered[index]];
+                let column = self
+                    .filtered
+                    .iter()
+                    .map(|i| display_width(&self.items[*i].label).unwrap_or(0))
+                    .max()
+                    .unwrap_or(0)
+                    .min(usize::from(context.width) / 2);
+                let label = truncate_text(&item.label, column as u16, "…")?;
+                let padding = column.saturating_sub(display_width(&label)?);
                 let text = format!(
-                    "{}{}  {}",
+                    "{}{}{}  {}",
                     if index == self.selected { "> " } else { "  " },
-                    item.label,
+                    label,
+                    " ".repeat(padding),
                     item.current_value
                 );
                 lines.push(Line {
@@ -256,8 +304,52 @@ impl Component for SettingsList {
     fn handle_event(
         &mut self,
         event: &ComponentEvent,
-        _host: &mut dyn ComponentHost,
+        host: &mut dyn ComponentHost,
     ) -> ComponentResult<EventResponse> {
+        if let Some((index, list)) = &mut self.submenu {
+            let accept = matches!(event,ComponentEvent::Key(e) if e.kind != KeyKind::Release && e.key==Key::Enter)
+                || matches!(event,ComponentEvent::Pointer(e) if e.kind==PointerKind::Click && e.button==Some(MouseButton::Left));
+            if matches!(event,ComponentEvent::Key(e) if e.kind!=KeyKind::Release && e.key==Key::Escape)
+            {
+                self.submenu = None;
+                return Ok(EventResponse {
+                    handled: true,
+                    redraw: true,
+                    ..EventResponse::default()
+                });
+            }
+            let response = list.handle_event(event, host)?;
+            if accept
+                && response.handled
+                && let Some(item) = list.selected_item()
+            {
+                let value = item.value.clone();
+                display_width(&value)?;
+                let target = &mut self.items[*index];
+                if value != target.current_value {
+                    target.current_value = value;
+                    if let Some(callback) = &mut self.on_change {
+                        callback(&target.id, &target.current_value);
+                    }
+                }
+                self.submenu = None;
+            }
+            return Ok(response);
+        }
+        if matches!(event,ComponentEvent::Key(e) if e.kind!=KeyKind::Release && e.key==Key::Enter && e.modifiers==Default::default())
+            && let Some(index) = self.filtered.get(self.selected).copied()
+            && let Some(provider) = &mut self.submenu_provider
+        {
+            let choices = provider(&self.items[index])?;
+            if !choices.is_empty() {
+                self.submenu = Some((index, SelectList::new(choices, self.max_visible)));
+                return Ok(EventResponse {
+                    handled: true,
+                    redraw: true,
+                    ..EventResponse::default()
+                });
+            }
+        }
         match event {
             ComponentEvent::Text(text) | ComponentEvent::Paste(text) if self.search => {
                 self.set_filter(&(self.query.clone() + text))?;

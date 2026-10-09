@@ -25,6 +25,10 @@ pub struct Input {
     prompt_width: usize,
     undo: VecDeque<(String, usize)>,
     on_submit: Option<SubmitCallback>,
+    kill_ring: crate::utils::kill_ring::KillRing,
+    last_kill: bool,
+    yank: Option<std::ops::Range<usize>>,
+    last_insert: Option<(std::time::Instant, usize)>,
 }
 
 impl Default for Input {
@@ -45,6 +49,10 @@ impl Input {
             prompt_width: 0,
             undo: VecDeque::new(),
             on_submit: None,
+            kill_ring: Default::default(),
+            last_kill: false,
+            yank: None,
+            last_insert: None,
         }
     }
     pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -77,6 +85,9 @@ impl Input {
         self.value = value;
         self.rendered_start = 0;
         self.undo.clear();
+        self.last_insert = None;
+        self.yank = None;
+        self.last_kill = false;
         Ok(())
     }
     fn checkpoint(&mut self) {
@@ -149,11 +160,47 @@ impl Input {
     fn insert(&mut self, text: &str) -> ComponentResult<()> {
         display_width(text)?;
         if !text.is_empty() {
-            self.checkpoint();
+            let merge = self.last_insert.is_some_and(|(at, cursor)| {
+                cursor == self.cursor && at.elapsed() < std::time::Duration::from_millis(500)
+            });
+            if !merge {
+                self.checkpoint();
+            }
             self.value.insert_str(self.cursor, text);
             self.cursor += text.len();
             self.align_cursor();
+            self.last_insert = Some((std::time::Instant::now(), self.cursor));
         }
+        Ok(())
+    }
+    fn kill(&mut self, start: usize, end: usize, backward: bool) {
+        let text = self.value[start..end].to_owned();
+        self.delete(start, end);
+        self.kill_ring.push(text, backward, self.last_kill);
+        self.last_kill = true;
+    }
+    fn yank(&mut self, rotate: bool) -> ComponentResult<()> {
+        let range = if rotate {
+            let Some(range) = self.yank.clone() else {
+                return Ok(());
+            };
+            self.kill_ring.rotate();
+            range
+        } else {
+            self.cursor..self.cursor
+        };
+        let Some(text) = self.kill_ring.peek().map(str::to_owned) else {
+            return Ok(());
+        };
+        if !self.boundaries().contains(&range.start) || !self.boundaries().contains(&range.end) {
+            self.yank = None;
+            return Ok(());
+        }
+        self.checkpoint();
+        self.value.replace_range(range.clone(), &text);
+        self.cursor = range.start + text.len();
+        self.align_cursor();
+        self.yank = Some(range.start..range.start + text.len());
         Ok(())
     }
 }
@@ -220,6 +267,30 @@ impl Component for Input {
         event: &ComponentEvent,
         _host: &mut dyn ComponentHost,
     ) -> ComponentResult<EventResponse> {
+        let killing = matches!(event, ComponentEvent::Key(e) if e.kind != KeyKind::Release && ((e.modifiers.control && matches!(e.key, Key::Character('u'|'k'|'w'))) || (e.modifiers.alt && matches!(e.key, Key::Character('d') | Key::Backspace | Key::Delete))));
+        if !killing {
+            self.last_kill = false;
+        }
+        let yanking = matches!(event, ComponentEvent::Key(e) if (e.modifiers.control || e.modifiers.alt) && e.key == Key::Character('y'));
+        if !yanking && !matches!(event, ComponentEvent::FocusChanged(_)) {
+            self.yank = None;
+        }
+        if !matches!(
+            event,
+            ComponentEvent::Text(_)
+                | ComponentEvent::Key(crate::protocol::KeyEvent {
+                    key: Key::Character(_),
+                    modifiers: crate::protocol::Modifiers {
+                        control: false,
+                        alt: false,
+                        super_key: false,
+                        ..
+                    },
+                    ..
+                })
+        ) {
+            self.last_insert = None;
+        }
         match event {
             ComponentEvent::Text(text) => self.insert(text)?,
             ComponentEvent::Paste(text) => {
@@ -237,9 +308,10 @@ impl Component for Input {
                     match key {
                         Key::Character('a') => self.cursor = 0,
                         Key::Character('e') => self.cursor = self.value.len(),
-                        Key::Character('u') => self.delete(0, self.cursor),
-                        Key::Character('k') => self.delete(self.cursor, self.value.len()),
-                        Key::Character('w') => self.delete(self.word_left(), self.cursor),
+                        Key::Character('u') => self.kill(0, self.cursor, true),
+                        Key::Character('k') => self.kill(self.cursor, self.value.len(), false),
+                        Key::Character('w') => self.kill(self.word_left(), self.cursor, true),
+                        Key::Character('y') => self.yank(false)?,
                         Key::Character('z') => {
                             if let Some((value, cursor)) = self.undo.pop_back() {
                                 self.value = value;
@@ -255,9 +327,10 @@ impl Component for Input {
                         Key::Character('b') | Key::Left => self.cursor = self.word_left(),
                         Key::Character('f') | Key::Right => self.cursor = self.word_right(),
                         Key::Character('d') | Key::Delete => {
-                            self.delete(self.cursor, self.word_right())
+                            self.kill(self.cursor, self.word_right(), false)
                         }
-                        Key::Backspace => self.delete(self.word_left(), self.cursor),
+                        Key::Backspace => self.kill(self.word_left(), self.cursor, true),
+                        Key::Character('y') => self.yank(true)?,
                         _ => return Ok(EventResponse::default()),
                     }
                 } else if !modifiers.control && !modifiers.alt {
@@ -350,6 +423,9 @@ impl Component for Input {
         self.cursor = cursor;
         self.rendered_start = 0;
         self.undo.clear();
+        self.last_insert = None;
+        self.last_kill = false;
+        self.yank = None;
         Ok(())
     }
 }

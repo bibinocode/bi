@@ -18,6 +18,24 @@ pub fn paint_layout(
     root_offset: Offset,
     buffer: &mut Buffer,
 ) -> ComponentResult<()> {
+    paint(root, root_offset, buffer, false)
+}
+
+/// 文本帧绘制，图片区域留给终端协议输出阶段。
+pub fn paint_layout_with_images(
+    root: &LayoutNode,
+    root_offset: Offset,
+    buffer: &mut Buffer,
+) -> ComponentResult<()> {
+    paint(root, root_offset, buffer, true)
+}
+
+fn paint(
+    root: &LayoutNode,
+    root_offset: Offset,
+    buffer: &mut Buffer,
+    allow_images: bool,
+) -> ComponentResult<()> {
     crate::layout::validate_layout(root)?;
     let area = buffer.area;
 
@@ -31,7 +49,7 @@ pub fn paint_layout(
     let nodes = flatten_layout(root, root_offset, viewport)?;
 
     for node in &nodes {
-        if !node.snapshot.images.is_empty() {
+        if !allow_images && !node.snapshot.images.is_empty() {
             return Err(ComponentError::OperationFailed {
                 message: "image rendering is not implemented".into(),
             });

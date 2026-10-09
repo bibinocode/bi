@@ -21,6 +21,10 @@ pub struct Runtime {
 
     focused: Option<ComponentHandle>,
     pub(super) pointer_capture: Option<ComponentHandle>,
+    pub(super) focus_scope: Option<ComponentHandle>,
+    saved_focus: Option<ComponentHandle>,
+    layout_handles: Option<std::collections::HashSet<crate::protocol::ComponentId>>,
+    keybindings: crate::keybindings::Keybindings,
 }
 
 impl Default for Runtime {
@@ -42,6 +46,10 @@ impl Runtime {
             receiver,
             focused: None,
             pointer_capture: None,
+            focus_scope: None,
+            saved_focus: None,
+            layout_handles: None,
+            keybindings: Default::default(),
         }
     }
 
@@ -51,6 +59,36 @@ impl Runtime {
 
     pub fn focused_handle(&self) -> Option<ComponentHandle> {
         self.focused
+    }
+    pub fn set_keybindings(&mut self, bindings: crate::keybindings::Keybindings) {
+        self.keybindings = bindings;
+    }
+    /// 限制键盘、鼠标和 Tab 到指定子树；关闭后恢复此前有效焦点。
+    /// 当前只允许一个模态范围，嵌套弹窗应放在此子树中。
+    pub fn set_focus_scope(&mut self, scope: Option<ComponentHandle>) -> ComponentResult<()> {
+        if let Some(scope) = scope {
+            if self.focus_scope.is_some() {
+                return Err(ComponentError::OperationFailed {
+                    message: "a modal focus scope is already active".into(),
+                });
+            }
+            if !self.is_active(scope) {
+                return Err(ComponentError::OperationFailed {
+                    message: "modal scope is not active".into(),
+                });
+            }
+            self.saved_focus = self.focused;
+            self.focus_scope = Some(scope);
+            self.pointer_capture = None;
+            self.set_focus(None)?;
+            self.focus_next(false)?;
+        } else if self.focus_scope.take().is_some() {
+            self.pointer_capture = None;
+            let saved = self.saved_focus.take().filter(|h| self.is_active(*h));
+            self.set_focus(saved)?;
+        }
+        self.request_redraw();
+        Ok(())
     }
 
     /// 按实例树前序遍历循环切换焦点；reverse 用于 Shift+Tab。
@@ -65,7 +103,14 @@ impl Runtime {
         }
         let mut handles = Vec::new();
         if let Some(root) = &self.root {
+            let root = self
+                .focus_scope
+                .and_then(|scope| find_node(root, scope))
+                .unwrap_or(root);
             collect(root, &mut handles);
+        }
+        if let Some(visible) = &self.layout_handles {
+            handles.retain(|handle| visible.contains(&handle.id));
         }
         if handles.is_empty() {
             return Ok(false);
@@ -85,6 +130,21 @@ impl Runtime {
 
     pub fn is_active(&self, handle: ComponentHandle) -> bool {
         self.registry.is_active(handle)
+    }
+    /// 获取带实例身份的发送端，后台任务只投递消息，不直接访问组件。
+    pub fn message_sender(
+        &self,
+        source: ComponentHandle,
+    ) -> ComponentResult<crate::protocol::MessageSender> {
+        if !self.is_active(source) {
+            return Err(ComponentError::OperationFailed {
+                message: "message source is not active".into(),
+            });
+        }
+        Ok(crate::protocol::MessageSender::new(
+            source,
+            self.sender.clone(),
+        ))
     }
 
     pub fn active_handle(&self, id: crate::protocol::ComponentId) -> Option<ComponentHandle> {
@@ -168,6 +228,18 @@ impl Runtime {
         };
         let layout = invoke_lifecycle("layout", || root.layout(context))?;
         crate::layout::validate_layout(&layout)?;
+        fn collect(
+            node: &LayoutNode,
+            handles: &mut std::collections::HashSet<crate::protocol::ComponentId>,
+        ) {
+            handles.insert(node.handle.id);
+            for child in &node.snapshot.children {
+                collect(&child.node, handles);
+            }
+        }
+        let mut handles = std::collections::HashSet::new();
+        collect(&layout, &mut handles);
+        self.layout_handles = Some(handles);
         Ok(Some(layout))
     }
 
@@ -215,8 +287,17 @@ impl Runtime {
                 .and_then(|root| find_node(root, handle))
                 .is_some_and(|node| find_node(node, target).is_some())
         };
-        let clear_focus = self.focused.is_some_and(contains);
         let clear_capture = self.pointer_capture.is_some_and(contains);
+        let clear_scope = self.focus_scope.is_some_and(contains);
+        if clear_scope {
+            self.set_focus_scope(None)?;
+        }
+        let clear_focus = self.focused.is_some_and(|target| {
+            self.root
+                .as_ref()
+                .and_then(|root| find_node(root, handle))
+                .is_some_and(|node| find_node(node, target).is_some())
+        });
         let focus_result = if clear_focus {
             self.set_focus(None)
         } else {
@@ -318,6 +399,9 @@ impl Runtime {
             self.focused = Some(candidate);
             cleanup = merge_results(cleanup, self.notify_focus(candidate, true));
         }
+        if self.focus_scope == Some(current) {
+            self.focus_scope = Some(candidate);
+        }
         self.request_redraw();
         cleanup.map(|()| candidate)
     }
@@ -341,6 +425,17 @@ impl Runtime {
     /// 状态先切换，再发送 FocusChanged 通知。
     /// 通知失败不会回滚焦点状态。
     pub fn set_focus(&mut self, target: Option<ComponentHandle>) -> ComponentResult<()> {
+        if let (Some(scope), Some(target)) = (self.focus_scope, target)
+            && self
+                .root
+                .as_ref()
+                .and_then(|root| find_node(root, scope))
+                .is_none_or(|node| find_node(node, target).is_none())
+        {
+            return Err(ComponentError::OperationFailed {
+                message: "focus target is outside modal scope".into(),
+            });
+        }
         if let Some(handle) = target {
             if !self.registry.is_active(handle) {
                 return Err(ComponentError::OperationFailed {
@@ -408,6 +503,10 @@ impl Runtime {
     ///
     /// 返回是否有组件消费了按键或文本事件。
     pub fn dispatch_key(&mut self, event: KeyEvent, text: Option<String>) -> ComponentResult<bool> {
+        let Some((event, remapped)) = self.keybindings.translate(event) else {
+            return Ok(true);
+        };
+        let text = if remapped { None } else { text };
         let handled = self.route_focused(&ComponentEvent::Key(event))?;
 
         if handled || event.kind == KeyKind::Release {
@@ -429,6 +528,9 @@ impl Runtime {
     ///
     /// 失焦或卸载失败，不会阻止其他组件的卸载和资源清理。
     pub fn shutdown(&mut self) -> ComponentResult<()> {
+        self.focus_scope = None;
+        self.saved_focus = None;
+        self.layout_handles = None;
         let focus_result = self.set_focus(None);
 
         self.pointer_capture = None;
@@ -474,6 +576,11 @@ impl Runtime {
             return Err(ComponentError::OperationFailed {
                 message: "focused component is not in the tree".into(),
             });
+        }
+        if let Some(scope) = self.focus_scope
+            && let Some(index) = path.iter().position(|h| *h == scope)
+        {
+            path.drain(..index);
         }
 
         // path 是根到目标，反序即目标到根。

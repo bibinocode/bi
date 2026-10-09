@@ -2,7 +2,7 @@ use std::io::{self, stdout};
 
 use crossterm::{
     Command,
-    cursor::Show,
+    cursor::{SetCursorStyle, Show},
     event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
         EnableFocusChange, EnableMouseCapture,
@@ -40,9 +40,90 @@ pub struct TerminalSession {
     terminal: DefaultTerminal,
     screen_mode: ScreenMode,
     state: TerminalState,
+    inline_height: Option<u16>,
+    dynamic_max: Option<u16>,
 }
 
 impl TerminalSession {
+    /// 主屏幕视口随当前文档高度变化，最高 max_height 行，至少一行。
+    pub fn main_screen_dynamic_with_input(
+        max_height: u16,
+        input_modes: InputModes,
+    ) -> io::Result<Self> {
+        if max_height == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "dynamic viewport maximum must be greater than zero",
+            ));
+        }
+        let mut session = Self::main_screen_with_input(1, input_modes)?;
+        session.dynamic_max = Some(max_height);
+        Ok(session)
+    }
+    pub fn dynamic_max_height(&self) -> Option<u16> {
+        self.dynamic_max
+    }
+    pub fn resize_inline_height(&mut self, height: u16) -> io::Result<()> {
+        if self.screen_mode != ScreenMode::Main || height == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "inline height requires main-screen mode and positive height",
+            ));
+        }
+        if self.inline_height == Some(height) {
+            return Ok(());
+        }
+        let area = self.terminal.get_frame().area();
+        self.terminal.clear()?;
+        self.terminal.set_cursor_position((area.x, area.y))?;
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(stdout()),
+            TerminalOptions {
+                viewport: Viewport::Inline(height),
+            },
+        )?;
+        self.terminal = terminal;
+        self.inline_height = Some(height);
+        Ok(())
+    }
+    /// 设置本会话的光标样式，关闭时恢复终端默认形状。
+    pub fn set_cursor_style(&mut self, style: SetCursorStyle) -> io::Result<()> {
+        self.state.cursor_style_owned = true;
+        execute!(stdout(), style)
+    }
+    /// 将文本提交到主屏幕滚动历史，不占用当前交互视口。
+    pub fn print_scrollback(&mut self, text: &str) -> crate::protocol::ComponentResult<()> {
+        if self.screen_mode != ScreenMode::Main {
+            return Err(crate::protocol::ComponentError::OperationFailed {
+                message: "scrollback output requires main-screen mode".into(),
+            });
+        }
+        let width = self
+            .terminal
+            .size()
+            .map_err(|e| crate::protocol::ComponentError::OperationFailed {
+                message: e.to_string(),
+            })?
+            .width;
+        let lines = crate::utils::text::wrap_text(text, width)?;
+        for chunk in lines.chunks(usize::from(u16::MAX)) {
+            self.terminal
+                .insert_before(chunk.len() as u16, |buffer| {
+                    for (row, line) in chunk.iter().enumerate() {
+                        buffer.set_string(
+                            buffer.area.x,
+                            buffer.area.y + row as u16,
+                            line,
+                            ratatui::style::Style::default(),
+                        );
+                    }
+                })
+                .map_err(|e| crate::protocol::ComponentError::OperationFailed {
+                    message: e.to_string(),
+                })?;
+        }
+        Ok(())
+    }
     pub fn alternate() -> io::Result<Self> {
         Self::alternate_with_input(InputModes::default())
     }
@@ -116,18 +197,25 @@ impl TerminalSession {
 
         let backend = CrosstermBackend::new(stdout());
 
+        let inline_height = match &viewport {
+            Viewport::Inline(height) => Some(*height),
+            _ => None,
+        };
         let terminal = Terminal::with_options(backend, TerminalOptions { viewport })?;
 
         Ok(Self {
             terminal,
             screen_mode,
             state,
+            inline_height,
+            dynamic_max: None,
         })
     }
 }
 
 #[derive(Default)]
 struct TerminalState {
+    cursor_style_owned: bool,
     raw_mode_owned: bool,
     alternate_screen_owned: bool,
     restore_cursor: bool,
@@ -160,6 +248,11 @@ impl TerminalState {
         );
 
         restore_command(&mut self.restore_cursor, Show, &mut first_error);
+        restore_command(
+            &mut self.cursor_style_owned,
+            SetCursorStyle::DefaultUserShape,
+            &mut first_error,
+        );
 
         restore_command(
             &mut self.alternate_screen_owned,

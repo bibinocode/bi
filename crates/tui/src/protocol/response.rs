@@ -40,4 +40,6 @@ pub struct EventResponse {
     pub request_focus: bool,
 
     pub pointer_capture: PointerCapture,
+    /// 滚动事件尚未消费的纵向行数；宿主用它替换向祖先传播的 rows。
+    pub scroll_remainder: Option<i32>,
 }

@@ -40,6 +40,7 @@ pub struct SelectList {
     visible: usize,
     on_select: Option<SelectCallback>,
     on_cancel: Option<Box<dyn FnMut()>>,
+    fuzzy: bool,
 }
 
 impl SelectList {
@@ -54,6 +55,7 @@ impl SelectList {
             visible: 0,
             on_select: None,
             on_cancel: None,
+            fuzzy: false,
         }
     }
     pub fn on_select(mut self, callback: impl FnMut(&SelectItem) + 'static) -> Self {
@@ -69,10 +71,34 @@ impl SelectList {
             .get(self.selected)
             .map(|index| &self.items[*index])
     }
+    pub fn with_fuzzy(mut self, enabled: bool) -> Self {
+        self.fuzzy = enabled;
+        self
+    }
     pub fn set_selected_index(&mut self, index: usize) {
         self.selected = index.min(self.filtered.len().saturating_sub(1));
     }
     pub fn set_filter(&mut self, filter: &str) {
+        if self.fuzzy {
+            let mut matches: Vec<_> = self
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(i, item)| {
+                    crate::utils::fuzzy::fuzzy_score(
+                        filter,
+                        &format!("{} {}", item.value, item.label),
+                    )
+                    .map(|score| (score, i))
+                })
+                .collect();
+            matches.sort_by_key(|item| std::cmp::Reverse(item.0));
+            self.filtered = matches.into_iter().map(|(_, i)| i).collect();
+            self.selected = 0;
+            self.start = 0;
+            self.visible = 0;
+            return;
+        }
         let filter = filter.to_lowercase();
         self.filtered = self
             .items
@@ -148,10 +174,25 @@ impl Component for SelectList {
                 .as_deref()
                 .unwrap_or_default()
                 .replace(['\r', '\n'], " ");
-            let text = if description.is_empty() {
+            let label_width = self
+                .filtered
+                .iter()
+                .map(|i| {
+                    crate::utils::text::display_width(
+                        &self.items[*i].label.replace(['\r', '\n'], " "),
+                    )
+                    .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+                .min(usize::from(context.width) / 2);
+            let text = if description.is_empty() || context.width < 16 {
                 format!("{prefix}{label}")
             } else {
-                format!("{prefix}{label}  {description}")
+                let label = truncate_text(&label, label_width as u16, "…")?;
+                let padding =
+                    label_width.saturating_sub(crate::utils::text::display_width(&label)?);
+                format!("{prefix}{label}{}  {description}", " ".repeat(padding))
             };
             let style = Style {
                 reversed: index == self.selected,

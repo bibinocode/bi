@@ -2,7 +2,7 @@ use crate::{
     component::{ChildPlacement, Component, ComponentNode, LayoutSnapshot},
     protocol::{
         ClipRect, ComponentError, ComponentEvent, ComponentHost, ComponentResult, EventResponse,
-        Key, KeyKind, LayoutContext, Offset, PointerKind,
+        Key, KeyKind, LayoutContext, Line, MouseButton, Offset, PointerCapture, PointerKind,
     },
 };
 
@@ -16,6 +16,9 @@ pub struct ScrollView {
     viewport_height: usize,
     follow_end: bool,
     following_end: bool,
+    scrollbar: bool,
+    layout_width: u16,
+    dragging_scrollbar: bool,
 }
 
 impl ScrollView {
@@ -27,11 +30,18 @@ impl ScrollView {
             viewport_height: 0,
             follow_end: false,
             following_end: false,
+            scrollbar: false,
+            layout_width: 0,
+            dragging_scrollbar: false,
         }
     }
     pub fn with_follow_end(mut self, enabled: bool) -> Self {
         self.follow_end = enabled;
         self.following_end = enabled;
+        self
+    }
+    pub fn with_scrollbar(mut self, enabled: bool) -> Self {
+        self.scrollbar = enabled;
         self
     }
     pub fn scroll_top(&self) -> usize {
@@ -80,7 +90,10 @@ impl Component for ScrollView {
                 reason: "ScrollView requires exactly one child".into(),
             });
         }
+        self.layout_width = context.width;
+        let child_width = context.width.saturating_sub(u16::from(self.scrollbar));
         let child_context = LayoutContext {
+            width: child_width,
             available_height: None,
             ..*context
         };
@@ -100,7 +113,34 @@ impl Component for ScrollView {
         let row = i64::try_from(self.scroll_top).map_err(|_| ComponentError::InvalidLayout {
             reason: "scroll offset exceeds i64".into(),
         })?;
+        let mut lines = Vec::new();
+        if self.scrollbar && context.width > 0 {
+            let thumb_height = self
+                .viewport_height
+                .saturating_mul(self.viewport_height)
+                .checked_div(self.content_height)
+                .unwrap_or(self.viewport_height)
+                .max(1)
+                .min(self.viewport_height);
+            let thumb_top = self
+                .scroll_top
+                .saturating_mul(self.viewport_height.saturating_sub(thumb_height))
+                .checked_div(maximum)
+                .unwrap_or(0);
+            for row in 0..self.viewport_height {
+                lines.push(Line::plain(format!(
+                    "{}{}",
+                    " ".repeat(usize::from(child_width)),
+                    if row >= thumb_top && row < thumb_top + thumb_height {
+                        "█"
+                    } else {
+                        "│"
+                    }
+                )));
+            }
+        }
         Ok(LayoutSnapshot {
+            lines,
             width: context.width,
             height: self.viewport_height,
             children: vec![ChildPlacement {
@@ -111,7 +151,7 @@ impl Component for ScrollView {
                 clip: Some(ClipRect {
                     column: 0,
                     row: 0,
-                    width: context.width,
+                    width: child_width,
                     height: self.viewport_height,
                 }),
                 node,
@@ -126,8 +166,61 @@ impl Component for ScrollView {
     ) -> ComponentResult<EventResponse> {
         let changed = match event {
             ComponentEvent::Pointer(event) => match event.kind {
-                PointerKind::Scroll { rows, .. } => self.scroll_by(i64::from(rows)),
+                PointerKind::Drag if self.dragging_scrollbar => {
+                    let maximum = self.content_height.saturating_sub(self.viewport_height);
+                    let row =
+                        (event.row.max(0) as usize).min(self.viewport_height.saturating_sub(1));
+                    self.scroll_to(
+                        row.saturating_mul(maximum) / self.viewport_height.saturating_sub(1).max(1),
+                    );
+                    return Ok(EventResponse {
+                        handled: true,
+                        redraw: true,
+                        ..EventResponse::default()
+                    });
+                }
+                PointerKind::Release if self.dragging_scrollbar => {
+                    self.dragging_scrollbar = false;
+                    return Ok(EventResponse {
+                        handled: true,
+                        pointer_capture: PointerCapture::Release,
+                        ..EventResponse::default()
+                    });
+                }
+                PointerKind::Scroll { rows, columns } => {
+                    let old = self.scroll_top;
+                    let changed = self.scroll_by(i64::from(rows));
+                    let consumed = self.scroll_top as i64 - old as i64;
+                    let remainder = (i64::from(rows) - consumed) as i32;
+                    return Ok(EventResponse {
+                        handled: remainder == 0 && columns == 0 && rows != 0,
+                        redraw: changed,
+                        scroll_remainder: Some(remainder),
+                        ..EventResponse::default()
+                    });
+                }
                 PointerKind::Press => {
+                    if self.scrollbar
+                        && event.button == Some(MouseButton::Left)
+                        && self.layout_width > 0
+                        && event.column == i32::from(self.layout_width.saturating_sub(1))
+                        && event.row >= 0
+                        && (event.row as usize) < self.viewport_height
+                    {
+                        let maximum = self.content_height.saturating_sub(self.viewport_height);
+                        self.scroll_to(
+                            (event.row as usize).saturating_mul(maximum)
+                                / self.viewport_height.saturating_sub(1).max(1),
+                        );
+                        self.dragging_scrollbar = true;
+                        return Ok(EventResponse {
+                            handled: true,
+                            redraw: true,
+                            request_focus: true,
+                            pointer_capture: PointerCapture::Acquire,
+                            ..EventResponse::default()
+                        });
+                    }
                     return Ok(EventResponse {
                         request_focus: true,
                         ..EventResponse::default()

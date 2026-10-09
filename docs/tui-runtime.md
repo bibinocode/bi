@@ -24,7 +24,7 @@ Crossterm → TerminalEvent → Runtime 事件路由 → Component
 
 键盘和粘贴从焦点组件向祖先传播。鼠标先命中最上层可见节点，再沿布局路径向祖先传播；各组件收到的是局部坐标。捕获指针后，即使鼠标移出视口，拖动和释放也会到达捕获组件。按下和释放位置、按钮一致且未拖动时，宿主生成 `Click`；同位置同按钮在 500 ms 内连续点击时递增 `click_count`。
 
-未被消费的 Tab/Shift+Tab 按实例树前序遍历循环切换焦点，只访问 `focusable()` 返回 true 的组件。当前不按视口可见性过滤焦点目标；被裁剪的焦点组件仍可接收键盘事件，但其硬件光标隐藏。
+未被消费的 Tab/Shift+Tab 按实例树前序遍历循环切换焦点，只访问 `focusable()` 返回 true 的组件。下一次布局后不访问因响应式规则或浮层配置而省略的节点，但不按视口裁剪过滤焦点目标；被裁剪的焦点组件仍可接收键盘事件，但其硬件光标隐藏。
 
 默认情况下，未被消费的 Escape 退出。组件消费 Escape 时，默认退出不执行；`RunOptions.exit_on_escape = false` 可关闭该退出规则。按下或重复 Ctrl+C 始终退出，释放 Ctrl+C 不退出。
 
@@ -46,21 +46,34 @@ Editor 状态版本为 1，使用 `application/x-bi-editor` 编码，保存编�
 
 ## TS 参考与差异
 
-| 参考模块 | Rust 对应实现 | 当前边界 |
+| 参考模块 | Rust 对应实现 | 行为与差异 |
 | --- | --- | --- |
-| `tui.ts`、`layout.ts`、`layout-node.ts` | component / protocol / layout / runtime | 保留 Rust 快照和实例版本模型；未实现 overlay |
-| `terminal.ts`、`tui-main-screen.ts`、`tui-alt-screen.ts` | TerminalSession、run、draw_runtime | 主屏幕为 Ratatui 固定高度 Inline 视口，不等同于 TS 动态文档滚动；未实现 TS 同步输出控制序列 |
-| `components/input.ts` | Input | 单行输入、字素编辑、水平滚动、提交、粘贴、单词导航、100 步撤销、状态恢复；没有 kill ring、yank 或撤销合并 |
-| `components/truncated-text.ts` | TruncatedText | 第一行截断和 Unicode 列宽；内边距由 BoxContainer 提供 |
-| `components/scroll-view.ts` | ScrollView | 一个子组件、纵向偏移、固定期望高度、可选跟随末尾、滚轮和键盘；边界可冒泡，未传递部分滚动的剩余量，未实现滚动条 |
-| `components/select-list.ts` | SelectList | 不区分大小写的 value 前缀过滤、循环导航、滚轮、点击和回调；描述与标签同一行，不使用 TS 的自适应描述列 |
-| `components/loader.ts`、`components/cancellable-loader.ts` | Loader、CancellableLoader、CancellationToken | 消息驱动帧切换，挂载创建定时线程、卸载取消；Escape 停止动画并设置协作取消信号，回调仅执行一次；不对应 JS AbortSignal 的完整 API |
-| `components/editor.ts`、`editor-component.ts` | Editor | 多行字素编辑、硬换行、可见行滚动、撤销、历史、原子粘贴标记和状态恢复；Enter 提交后清空，Alt/Shift/Ctrl+Enter 换行；Alt+Up/Down 浏览历史，与 TS 普通上下键历史规则不同；没有 kill ring、撤销合并、主题边框或大单行字符数压缩 |
-| `autocomplete.ts` | AutocompleteProvider、CommandAutocomplete | 按 Tab 请求斜杠命令候选，匹配当前逻辑行开头的命令前缀；没有路径补全、模糊排序或输入时自动弹出候选 |
-| `components/settings-list.ts` | SettingsList、SettingItem | 值循环、只读项、标签子串搜索、描述、鼠标与回调；上下导航不循环，没有 TS 模糊搜索、动态子菜单或列对齐；描述最多三行 |
-| `utils.ts` | utils::text | 纯文本列宽、硬换行和截断，拒绝控制字符；不解析 ANSI |
+| `tui.ts`、`layout.ts`、`layout-node.ts` | component / protocol / layout / runtime、Overlay | 保留结构化快照、实例版本、资源与消息模型；浮层按绘制顺序合成，支持居中/指定位置/隐藏；模态焦点限制为一个活动子树 |
+| `terminal.ts`、`tui-main-screen.ts`、`tui-alt-screen.ts` | TerminalSession、run、draw_runtime、TerminalOutput | 固定或动态高度 Inline 视口；显式 print_scrollback 提交历史；同步更新包裹文本与外部协议；不自动把组件文档变化提交为历史，也不完全复刻 TS 主屏幕文档算法 |
+| `components/input.ts`、`components/editor.ts`、`kill-ring.ts`、`undo-stack.ts` | Input、Editor、KillRing | 字素编辑、单词导航、kill/yank/yank-pop；连续 Text 插入在 500ms 内合并撤销；最多 100 撤销与删除记录；Editor 原子粘贴、状态恢复、历史；Alt+Up/Down 浏览历史，仍与 TS 普通上下键规则不同 |
+| `autocomplete.ts`、`fuzzy.ts` | CommandAutocomplete、PathAutocomplete、CombinedAutocomplete、fuzzy_score | 斜杠命令、文件/目录、带空格引号、Unicode、可选子序列排序；编辑器可输入时请求候选；同步枚举目录，无外部搜索进程，评分算法不保证与 TS 相同 |
+| `components/markdown.ts` | Markdown、styled_text、pulldown-cmark、syntect | 标题、强调、删除线、任务列表、引用、表格文本、代码块高亮和链接元数据；结构化字素折行；HTML 显示为文本，Markdown 图片显示替代文本；基础数学表达式转为 Unicode（希腊字母、上下标、根号、行内分式等），未知/不完整语法保留源码；没有 TS 的多行矩阵和展示分式排版 |
+| `components/image.ts`、`terminal-image.ts` | Image、TerminalOutput | PNG/JPEG/GIF/WebP 解码后转 PNG，Kitty/iTerm2 编码，裁剪及浮层遮挡；无能力时替代文本；GIF 输出静态解码帧，不播放动画 |
+| `components/scroll-view.ts` | ScrollView | 可选滚动条及点击定位；滚动边界向祖先传递剩余 rows；单子项、跟随末尾、键盘/滚轮；支持指针捕获后的滚动条拖动 |
+| `alt-screen-search.ts` | SearchView | Ctrl+F、Enter/Shift+Enter 跳转、Escape 关闭；区分大小写的单行匹配，匹配行去重；不跨行，不保证 TS 搜索所有快捷键与提示位置导航一致 |
+| `components/alt-screen-flash.ts` | Flash | bi.flash 消息添加提示，定时消息过期，卸载取消线程；可作为普通组件放置，不限定备用屏幕 |
+| `components/select-list.ts` | SelectList | 可选模糊排序、循环导航、自适应标签/描述列；前缀过滤保持默认行为 |
+| `components/settings-list.ts` | SettingsList、SettingItem | 值循环、只读项、标签搜索、可选模糊排序、列对齐、Enter 动态子菜单与修改回调；描述最多三行，点击仍执行普通值循环 |
+| `components/h-stack.ts`、`components/v-stack.ts`、`components/stack.ts` | HStack、VStack、StackEntry | 保留简易分配 API；with_entries 支持 basis/grow/shrink/min/max、stretch、按父宽度隐藏；隐藏项不布局也不占间距；配置按子节点位置对应 |
+| `components/mouse-region.ts` | MouseRegion | 单子项、事件冒泡、局部坐标、捕获响应；不生成进入/离开事件 |
+| `components/loader.ts`、`components/cancellable-loader.ts` | Loader、CancellableLoader、CancellationToken | 消息驱动动画与协作取消；不对应 JS AbortSignal 完整 API |
+| `keys.ts`、`keybindings.ts` | KeyChord、Keybindings | 字符串解析、布局键匹配、会话级重映射与禁用；目标为规范按键，不照搬 TS 字符串动作名注册表；Ctrl+C 的宿主退出规则优先于重映射 |
+| `utils.ts`、颜色与原生输入辅助 | utils / protocol / Crossterm / Ratatui | 列宽、文本折行、截断、结构化样式；不解析用户提供的 ANSI，不移植 TS 的 native 模块加载与 ANSI 字符串渲染器 |
 
-Markdown、文件补全、图片协议、OSC 8 超链接输出和横向 Stack 尚未实现。可见布局中的图片请求会明确报错，超链接元数据目前不转换成终端控制序列。
+`draw_runtime()` 支持 TestBackend，也生成最终 Buffer 供外部协议输出。它本身不会向 stdout 发送图片或链接；`run()` 调用 `TerminalOutput::write_frame()` 完成这一步。裸 `paint_layout()` 仍拒绝图片，调用 `paint_layout_with_images()` 才允许预留图片区域。图片经过裁剪与上层文本/背景遮挡后按可见矩形编码；Kitty 只删除本输出器生成的 ID，iTerm2 在下一帧清除并重画文本视口。图片编码在 UI 线程执行，大图可能阻塞输入，不把它描述成后台异步渲染。
+
+`RunOptions::default()` 通过环境标识推断能力，调用方可以覆盖 capabilities；推断不保证实际终端支持，也不发送主动探测查询。没有图片能力时 Image 使用替代文本。超链接 URL 拒绝控制字符；内容始终是结构化纯文本，终端控制序列仅由输出器生成。链接目标变化或移除时重新写对应单元格，避免旧目标残留。
+
+`Runtime::set_focus_scope(Some(handle))` 限制焦点、Tab 与事件传播到子树，None 关闭并恢复此前仍有效的焦点。隐藏浮层前应关闭它的焦点范围；动态隐藏的节点在下一次布局后不参与 Tab。普通被裁剪节点仍保留原有焦点遍历行为。`message_sender(handle)` 提供带实例身份的发送端，旧实例消息仍按现有版本规则丢弃。
+
+HStack 的宽度配置按子节点位置对应，未配置项按 Fill(1) 处理；Fixed 项按顺序优先分配，Fill(0) 不获得宽度。间距先从宽度预算中扣除，超出视口的间距被裁剪。零宽子项仍执行布局以更新组件缓存，但不撑高容器。最大余数法分配按权重计算后的整数剩余列，余数相同时优先靠前的子项。被压成零宽的可聚焦节点仍参与现有焦点遍历，光标因不可见而隐藏。
+
+VStack 默认 Auto 高度，先测量各子项完整内容。有父高度上限时先扣除间距，按顺序分配 Auto/Fixed，再通过最大余数法让 Fill 分享剩余行；之后按分配高度重新布局子项，使编辑器、滚动视图和嵌套 Stack 获得实际高度上限。Fixed 的空白行也计入容器高度，各子项有独立裁剪范围。没有高度上限时 Auto 与正权重 Fill 使用完整内容高度。与 Container 的完整快照裁剪方式不同，受限的 VStack 子项会按分配高度重新生成快照。
 
 ## 验证
 
@@ -69,6 +82,10 @@ cargo test -p bi-tui
 cargo clippy -p bi-tui --all-targets -- -D warnings
 cargo run -p bi-tui --example headless
 cargo run -p bi-tui --example editor -- --headless
+cargo run -p bi-tui --example stack -- --headless
+cargo run -p bi-tui --example features -- --headless
 ```
 
 自动化覆盖输入字素编辑、状态恢复、队列版本校验、候选失败回退、清理失败后继续卸载、焦点、点击与捕获、嵌套裁剪、光标、Unicode 绘制、旧帧清除、Loader 消息、多行编辑、补全范围校验、原子粘贴、编辑历史、设置搜索与取消。真实终端中的键盘协议、鼠标支持、字体宽度与 raw mode 恢复仍需要在目标终端中运行交互示例检查。
+
+新增自动化覆盖 Markdown/高亮、结构化样式折行、路径与引号、模糊匹配、自动候选、kill/yank/撤销合并、弹性尺寸、隐藏焦点、模态恢复、搜索、动态设置子菜单、临时提示、剩余滚动量、图片裁剪/遮挡与协议编码、链接移除及快捷键重映射。动态主屏幕、同步更新和图片的真实显示仍需目标终端验证。
